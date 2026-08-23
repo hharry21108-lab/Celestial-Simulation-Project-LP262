@@ -1,0 +1,325 @@
+﻿#define _USE_MATH_DEFINES
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <barrier>
+#include <cmath>
+#include <atomic>
+#include <deque>
+#include <string>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <GLFW/glfw3.h>
+
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+
+using namespace std;
+
+enum SimMode { MODE_LIVE, MODE_PAUSED, MODE_PLAYBACK };
+
+struct Body {
+    string name;
+    double mass;
+    glm::dvec3 pos, vel;
+    glm::vec3 color;
+    deque<glm::dvec3> trail;
+    vector<glm::dvec3> history;
+    bool showTrail = true;
+    bool isSpaceship = false;
+
+    Body(string n, double m, glm::dvec3 p, glm::dvec3 v, glm::vec3 c, bool ship = false)
+        : name(n), mass(m), pos(p), vel(v), color(c), isSpaceship(ship) {
+    }
+};
+
+// --- 全局配置 ---
+const double G = 6.67430e-11;
+const double AU = 1.496e11;
+double base_dt = 360.0;
+float timeScale = 1.0f;
+SimMode currentMode = MODE_LIVE;
+int playbackFrame = 0;
+const int max_history = 15000;
+
+vector<Body> b;
+vector<glm::dvec3> shared_pos;
+atomic<bool> quit{ false };
+bool showUI = true;
+int focusID = 0;
+
+// --- 相机控制变量 ---
+bool freeCamera = false;
+float camYaw = 0.5f, camPitch = 0.4f, camDist = 150.0f;
+glm::dvec3 freeCamPos = glm::dvec3(0, 100, 300);
+float moveSpeed = 1.0f;
+double lastX, lastY;
+
+// 统一缩放回调
+void scroll_callback(GLFWwindow* window, double x, double y) {
+    if (freeCamera) {
+        // 自由视角下滚轮向前=坐标推进
+        glm::vec3 forward = glm::vec3(sin(camYaw) * cos(camPitch), -sin(camPitch), -cos(camYaw) * cos(camPitch));
+        double s = (double)camDist * 0.1; // 步长随当前参考距离变化
+        if (y > 0) freeCamPos += (glm::dvec3)forward * s; else freeCamPos -= (glm::dvec3)forward * s;
+    }
+    else {
+        // 锁定模式下滚轮改变观察半径
+        if (y > 0) camDist *= 0.85f; else camDist *= 1.15f;
+        camDist = glm::clamp(camDist, 0.05f, 80000.0f);
+    }
+}
+
+void physics_worker(int id, std::barrier<>& sync) {
+    while (!quit) {
+        if (currentMode != MODE_LIVE) {
+            this_thread::sleep_for(chrono::milliseconds(10));
+            continue;
+        }
+        double dt = base_dt * (double)timeScale;
+        for (int s = 0; s < 500; ++s) {
+            b[id].pos += b[id].vel * dt;
+            shared_pos[id] = b[id].pos;
+            sync.arrive_and_wait();
+            glm::dvec3 acc{ 0,0,0 };
+            for (int j = 0; j < (int)b.size(); ++j) {
+                if (j == id) continue;
+                glm::dvec3 diff = shared_pos[j] - shared_pos[id];
+                double r2 = glm::dot(diff, diff) + 1e8;
+                acc += (G * b[j].mass / (r2 * sqrt(r2))) * diff;
+            }
+            b[id].vel += acc * dt;
+            sync.arrive_and_wait();
+        }
+    }
+}
+
+bool ProjectToScreen(const glm::dvec3& worldPos, const glm::mat4& viewProj, int w, int h, ImVec2& outPos) {
+    glm::vec4 clipPos = viewProj * glm::vec4(worldPos, 1.0f);
+    if (clipPos.w <= 0) return false;
+    glm::vec3 ndc = glm::vec3(clipPos) / clipPos.w;
+    outPos.x = (ndc.x + 1.0f) * 0.5f * (float)w;
+    outPos.y = (1.0f - ndc.y) * 0.5f * (float)h;
+    return true;
+}
+
+void render_loop() {
+    if (!glfwInit()) return;
+    GLFWwindow* window = glfwCreateWindow(1440, 900, "Solar Lab Pro - Interactive Camera", NULL, NULL);
+    glfwMakeContextCurrent(window);
+    glfwSetScrollCallback(window, scroll_callback);
+    IMGUI_CHECKVERSION(); ImGui::CreateContext();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 130");
+
+    while (!glfwWindowShouldClose(window) && !quit) {
+        glfwPollEvents();
+
+        static bool spacePressed = false;
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS && !spacePressed) {
+            currentMode = (currentMode == MODE_LIVE) ? MODE_PAUSED : MODE_LIVE;
+            spacePressed = true;
+        }
+        if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_RELEASE) spacePressed = false;
+
+        // --- 1. 鼠标交互核心逻辑 ---
+        if (!ImGui::GetIO().WantCaptureMouse) {
+            double mx, my; glfwGetCursorPos(window, &mx, &my);
+            double dx = mx - lastX;
+            double dy = my - lastY;
+
+            // 左键：旋转视角
+            if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+                camYaw += (float)dx * 0.005f;
+                camPitch += (float)dy * 0.005f;
+                camPitch = glm::clamp(camPitch, -1.5f, 1.5f);
+            }
+            // 右键：自由模式下的位置平移
+            if (freeCamera && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS) {
+                glm::vec3 forward = glm::vec3(sin(camYaw), 0, -cos(camYaw)); // 水平前
+                glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0, 1, 0)));
+                float s = moveSpeed * camDist * 0.001f;
+                freeCamPos -= (glm::dvec3)right * (dx * s);
+                freeCamPos += (glm::dvec3)forward * (dy * s);
+            }
+            lastX = mx; lastY = my;
+        }
+
+        // 键盘备用移动 (WASDQE)
+        if (freeCamera) {
+            glm::vec3 forward = glm::vec3(sin(camYaw) * cos(camPitch), -sin(camPitch), -cos(camYaw) * cos(camPitch));
+            glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0, 1, 0)));
+            float s = moveSpeed * camDist * 0.01f;
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) freeCamPos += (glm::dvec3)forward * (double)s;
+            if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) freeCamPos -= (glm::dvec3)forward * (double)s;
+            if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) freeCamPos -= (glm::dvec3)right * (double)s;
+            if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) freeCamPos += (glm::dvec3)right * (double)s;
+            if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) freeCamPos.y += (double)s;
+            if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) freeCamPos.y -= (double)s;
+        }
+
+        ImGui_ImplOpenGL3_NewFrame(); ImGui_ImplGlfw_NewFrame(); ImGui::NewFrame();
+        int w, h; glfwGetFramebufferSize(window, &w, &h);
+        glViewport(0, 0, w, h); glClearColor(0.005f, 0.005f, 0.01f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
+
+        if (currentMode == MODE_LIVE) {
+            for (auto& body : b) {
+                body.history.push_back(body.pos);
+                if (body.history.size() > max_history) body.history.erase(body.history.begin());
+            }
+        }
+
+        // --- 2. 相机变换 ---
+        double drawScale = 2.0e-9;
+        glm::dvec3 cameraPos, targetPos;
+        if (freeCamera) {
+            cameraPos = freeCamPos;
+            targetPos = freeCamPos + (glm::dvec3)glm::vec3(sin(camYaw) * cos(camPitch), -sin(camPitch), -cos(camYaw) * cos(camPitch));
+        }
+        else {
+            glm::dvec3 focusWorldPos = (currentMode == MODE_PLAYBACK && !b[focusID].history.empty()) ? b[focusID].history[playbackFrame] : b[focusID].pos;
+            targetPos = focusWorldPos * drawScale;
+            cameraPos = targetPos + (glm::dvec3)glm::vec3(camDist * cos(camPitch) * sin(camYaw), camDist * sin(camPitch), camDist * cos(camPitch) * cos(camYaw));
+            freeCamPos = cameraPos;
+        }
+        glm::mat4 viewProj = glm::perspective(glm::radians(45.0f), (float)w / h, 0.1f, 150000.0f) * glm::lookAt((glm::vec3)cameraPos, (glm::vec3)targetPos, glm::vec3(0, 1, 0));
+
+        ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+
+        // --- 3. 渲染 ---
+        for (int i = 0; i < (int)b.size(); i++) {
+            glm::dvec3 visualPos = (currentMode == MODE_PLAYBACK && !b[i].history.empty()) ? b[i].history[playbackFrame] : b[i].pos;
+            glm::dvec3 rPos = visualPos * drawScale;
+            int r = (int)(b[i].color.x * 255), g = (int)(b[i].color.y * 255), bv = (int)(b[i].color.z * 255);
+
+            if (b[i].showTrail) {
+                if (currentMode == MODE_PLAYBACK && !b[i].history.empty()) {
+                    for (int j = 1; j <= playbackFrame; j++) {
+                        ImVec2 p1, p2;
+                        if (ProjectToScreen(b[i].history[j - 1] * drawScale, viewProj, w, h, p1) && ProjectToScreen(b[i].history[j] * drawScale, viewProj, w, h, p2))
+                            drawList->AddLine(p1, p2, IM_COL32(r, g, bv, 80), 1.5f);
+                    }
+                }
+                else if (currentMode == MODE_LIVE) {
+                    b[i].trail.push_back(rPos);
+                    if (b[i].trail.size() > 2500) b[i].trail.pop_front();
+                    for (size_t j = 1; j < b[i].trail.size(); j++) {
+                        ImVec2 p1, p2;
+                        if (ProjectToScreen(b[i].trail[j - 1], viewProj, w, h, p1) && ProjectToScreen(b[i].trail[j], viewProj, w, h, p2))
+                            drawList->AddLine(p1, p2, IM_COL32(r, g, bv, 120), 2.0f);
+                    }
+                }
+            }
+
+            ImVec2 sp;
+            if (ProjectToScreen(rPos, viewProj, w, h, sp)) {
+                float size = (i == 0) ? 12.0f : (b[i].mass > 1e26 ? 6.0f : 3.5f);
+                drawList->AddCircleFilled(sp, size, IM_COL32(r, g, bv, 255));
+                if (showUI) drawList->AddText(ImVec2(sp.x + 8, sp.y - 8), IM_COL32(255, 255, 255, 180), b[i].name.c_str());
+            }
+        }
+
+        if (showUI) {
+            ImGui::Begin("Cosmos Lab Pro", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::Text("Controls: Left-Drag: Rotate | Right-Drag: Move (Free) | Scroll: Zoom");
+            ImGui::Checkbox("FREE CAMERA MODE", &freeCamera);
+            if (freeCamera) ImGui::SliderFloat("Move Speed", &moveSpeed, 0.1f, 10.0f);
+
+            ImGui::Separator();
+            if (ImGui::Button(currentMode == MODE_LIVE ? "PAUSE (Space)" : "RESUME (Space)"))
+                currentMode = (currentMode == MODE_LIVE) ? MODE_PAUSED : MODE_LIVE;
+            ImGui::SameLine();
+            if (ImGui::Button("CLEAR TRAILS")) { for (auto& body : b) body.trail.clear(); }
+
+            ImGui::PushStyleColor(ImGuiCol_Button, (ImVec4)ImColor::HSV(0.0f, 0.6f, 0.6f));
+            if (ImGui::Button("RESET ALL HISTORY", ImVec2(-1, 0))) {
+                for (auto& body : b) { body.history.clear(); body.trail.clear(); }
+                playbackFrame = 0; currentMode = MODE_LIVE;
+            }
+            ImGui::PopStyleColor();
+
+            ImGui::SliderFloat("Sim Speed", &timeScale, 0.0f, 20.0f, "%.1fx");
+            ImGui::Separator();
+
+            int maxFrame = (b[0].history.empty()) ? 0 : (int)b[0].history.size() - 1;
+            if (ImGui::SliderInt("Replay Seek", &playbackFrame, 0, maxFrame)) {
+                if (!b[0].history.empty()) currentMode = MODE_PLAYBACK;
+            }
+            if (currentMode == MODE_PLAYBACK && ImGui::Button("Return to Live")) currentMode = MODE_LIVE;
+
+            ImGui::Separator();
+            for (int i = 0; i < (int)b.size(); i++) {
+                ImGui::PushID(i);
+                ImGui::Checkbox("##t", &b[i].showTrail); ImGui::SameLine();
+                if (ImGui::Selectable(b[i].name.c_str(), focusID == i && !freeCamera)) {
+                    focusID = i; freeCamera = false;
+                }
+                ImGui::PopID();
+            }
+            ImGui::End();
+        }
+        ImGui::Render(); ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+    }
+    quit = true;
+    glfwTerminate();
+}
+
+int main() {
+    // --- 核心物理常数 ---
+    const double AU = 1.496e11;
+    const double earth_v = 29780.0;
+    const double moon_dist = 384400000.0;
+    const double moon_v_rel = 1022.0;
+
+    // --- 1. 计算地日 L4/L5 (领先/落后地球 60 度) ---
+    double l4_angle = M_PI / 3.0;
+    glm::dvec3 l4_pos(AU * cos(l4_angle), 0, -AU * sin(l4_angle));
+    glm::dvec3 l4_vel(earth_v * sin(l4_angle), 0, earth_v * cos(l4_angle));
+
+    double l5_angle = -M_PI / 3.0;
+    glm::dvec3 l5_pos(AU * cos(l5_angle), 0, -AU * sin(l5_angle));
+    glm::dvec3 l5_vel(earth_v * sin(l5_angle), 0, earth_v * cos(l5_angle));
+    // 坐标系说明：俯视视角下，逆时针 = 自西向东 = 顺行 (Prograde)
+    b.clear();
+
+    // --- 太阳 ---
+    b.emplace_back("Sun", 1.989e30, glm::dvec3(0), glm::dvec3(0), glm::vec3(1.0f, 0.9f, 0.1f));
+
+    // --- 顺行天体 (Prograde: 自西向东/逆时针) ---
+    // 逻辑：位置在 +X，速度在 +Z
+    b.emplace_back("Mercury", 3.301e23, glm::dvec3(0.387 * AU, 0, 0), glm::dvec3(0, 0, 47400), glm::vec3(0.7f, 0.7f, 0.7f));
+    b.emplace_back("Venus", 4.867e24, glm::dvec3(0.723 * AU, 0, 0), glm::dvec3(0, 0, 35000), glm::vec3(1.0f, 0.8f, 0.4f));
+
+    // 地月系统 (月球相对于地球也是自西向东)
+    b.emplace_back("Earth", 5.972e24, glm::dvec3(AU, 0, 0), glm::dvec3(0, 0, earth_v), glm::vec3(0.2f, 0.6f, 1.0f));
+    b.emplace_back("Moon", 7.347e22, glm::dvec3(AU + moon_dist, 0, 0), glm::dvec3(0, 0, earth_v + moon_v_rel), glm::vec3(0.6f, 0.6f, 0.6f));
+
+    // 拉格朗日点 L4/L5 (跟随地球逆时针旋转)
+    b.emplace_back("Earth L4", 1e4, l4_pos, l4_vel, glm::vec3(0.0f, 1.0f, 0.5f), true);
+    b.emplace_back("Earth L5", 1e4, l5_pos, l5_vel, glm::vec3(0.0f, 1.0f, 0.5f), true);
+
+    // 外行星 (自西向东)
+    b.emplace_back("Mars", 6.39e23, glm::dvec3(1.524 * AU, 0, 0), glm::dvec3(0, 0, 24100), glm::vec3(1.0f, 0.4f, 0.3f));
+    b.emplace_back("Jupiter", 1.898e27, glm::dvec3(5.203 * AU, 0, 0), glm::dvec3(0, 0, 13070), glm::vec3(0.8f, 0.7f, 0.5f));
+    b.emplace_back("Saturn", 5.683e26, glm::dvec3(9.537 * AU, 0, 0), glm::dvec3(0, 0, 9690), glm::vec3(0.9f, 0.8f, 0.4f));
+    b.emplace_back("Uranus", 8.681e25, glm::dvec3(19.191 * AU, 0, 0), glm::dvec3(0, 0, 6810), glm::vec3(0.5f, 0.9f, 1.0f));
+    b.emplace_back("Neptune", 1.024e26, glm::dvec3(30.069 * AU, 0, 0), glm::dvec3(0, 0, 5430), glm::vec3(0.2f, 0.3f, 1.0f));
+    b.emplace_back("Pluto", 1.303e22, glm::dvec3(39.482 * AU, 0, 0), glm::dvec3(0, 0, 4740), glm::vec3(0.7f, 0.5f, 0.3f));
+
+    // --- 逆行天体 (Retrograde: 自东向西/顺时针) ---
+    // 逻辑：位置在 +X，速度在 -Z
+    b.emplace_back("Halley", 2.2e14, glm::dvec3(35.08 * AU, 0, 0), glm::dvec3(0, 0, -910), glm::vec3(1.0f, 1.0f, 1.0f));
+
+    // 旅行者号 (Voyager): 逃逸速度探测器
+    b.emplace_back("Voyager", 1e4, glm::dvec3(1.1 * AU, 0, 0), glm::dvec3(10000, 0, 35000), glm::vec3(1.0f, 1.0f, 1.0f), true);
+    shared_pos.resize(b.size());
+    std::barrier sync((int)b.size());
+    vector<thread> workers;
+    for (int i = 0; i < (int)b.size(); i++) workers.emplace_back(physics_worker, i, ref(sync));
+    render_loop();
+    for (auto& t : workers) t.join();
+    return 0;
+}

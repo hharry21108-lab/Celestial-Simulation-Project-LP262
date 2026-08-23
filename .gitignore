@@ -1,0 +1,11 @@
+﻿.vs/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+*.exe
+*.obj
+*.pdb
+*.suo
+*.user
+.vscode/
