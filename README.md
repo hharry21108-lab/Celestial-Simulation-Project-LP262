@@ -114,20 +114,20 @@ $$
 	
 	- **基本常量与内容定义**
 		首先需对部分基本物理常量定义，方便简化后续编程
-		```cpp
+```cpp
 		const double G = 6.67430e-11;
 		const double AU = 1.496e11;
-		```
-		然后便是存储每个天体的基本数值{名称，质量，坐标，速度坐标，加速度坐标}
-		```cpp
+```
+然后便是存储每个天体的基本数值{名称，质量，坐标，速度坐标，加速度坐标}
+```cpp
 		struct Body {
 		    string name;
 		    double mass;
 		    double x, y, vx, vy, ax, ay;
 		    SDL_Color color;
 		};
-		```
-	- **万有引力场下的自相互作用**
+```
+- **万有引力场下的自相互作用**
 		由于有n个天体同时存在，那么每个天体都会受到其余n-1个天体的万有引力作用，那么对于第i个天体，其所受和引力大小为
 
 $$
@@ -155,7 +155,7 @@ $$
 注意我们必须先求出万有引力大小再分解，如果直接将万有引力公式中的 ${\lvert \vec{r}_j - \vec{r}_i \rvert^2}$ 为 ${\lvert \vec{x}_j - \vec{x}_i \rvert^2}$ 以及${\lvert \vec{y}_j - \vec{y}_i \rvert^2}$ ，再分别在x，y方向合求出 $a_ix$ 与 $a_iy$ ，此时 ${a_ix}^2+{a_iy}^2$与${a_i}^2$ 并不完全等价，所以只能先求出第j个天体对于第i个天体的引力，再分解为x，y两方向，再求合，不可直接在x，y两个方向计算。
 		我们将计算结果写至代码中，便有了
 		
-		```cpp
+```cpp
 		void compute_acceleration(int id, int n, double& ax, double& ay) {
 		    ax = 0.0; ay = 0.0;
 		    const double soft = 1e7;
@@ -169,7 +169,7 @@ $$
 		        ax += f_newton * dx; ay += f_newton * dy;
 		    }
 		}
-		```
+```
 		
 - **位移的更新**
 		我们已知了各个行星初始坐标以及此刻的加速度，为了在指定步长进行更新位移和速度，我们需要采用积分法进行。由于宇宙是一个哈密顿系统（Hamiltonian System），即存在一定的守恒性，因此当我最初采用欧拉积分法时，由于能量的漂移，地球飞离了太阳系，因此随后我决定采用幸积分法，其可以达到长期能量守恒（无能量漂移），也就是说这对于研究轨道的混沌性和稳定性至关重要。
@@ -194,7 +194,7 @@ $$
 
 将其写入代码中，即为：
 
-		```cpp
+```cpp
 		auto worker = [&](int id) {
 		    for (int step = 0; step < steps; ++step) {
 		        compute_acceleration(id, n, b[id].ax, b[id].ay); // 计算第一次加速度
@@ -212,13 +212,13 @@ $$
 		        old_y[id] = b[id].y;
 		    }
 		};
-		```
+```
 		
 通过两部分代码的相互调用，我们已经可以实现了模拟（附图-地日月系统-python+坐标绘图）
 ![轨道模拟](天体模拟LP262-1774758428441.webp)
 但是，为了更高的精度，继续采用高阶幸积分，这里为四阶幸积分法
 		
-		```cpp
+```cpp
 		void physics_worker_pooled(int thread_id, int num_threads, int n, barrier<>& sync) {
 		    while (!quit) {
 		        for (int sub = 0; sub < 20; ++sub) {
@@ -242,7 +242,7 @@ $$
 		        }
 		    }
 		}
-		```
+```
 		
 此刻轨道模拟已经一定程度上的精准，在增加实时监听代码后（见后一部分），可以进行模拟。
 - **补充-相对论修正**
@@ -254,7 +254,7 @@ $$
 
   代码转译
   
-		```cpp
+```cpp
 		if (b[j].mass > 1e29) {
 		    double v2 = b[id].vx * b[id].vx + b[id].vy * b[id].vy;
 		    double r_v = (dx * b[id].vx + dy * b[id].vy);
@@ -265,7 +265,7 @@ $$
 		else {
 		    ax += f_newton * dx; ay += f_newton * dy;
 		}
-		```
+```
   
 - **代码、功能优化**
 		监听改进：当首次验证通过后，需要大量的坐标推演验证理论，因此运行一段时间后再导出坐标进行绘制的方法过于浪费时间，不可取，因而写实时监听至c++23代码，实时显示坐标、回放、暂停等，并在此基础上改进为四阶辛积分（改进辛积分算法部分见上部分）。
